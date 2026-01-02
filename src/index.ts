@@ -37,9 +37,9 @@ import { opus } from "prism-media";
 time("Ready");
 loadEnvFile();
 const rest = new REST({
-	version: APIVersion,
-	hashSweepInterval: 0,
 	handlerSweepInterval: 0,
+	hashSweepInterval: 0,
+	version: APIVersion,
 }).setToken(env["DISCORD_TOKEN"]!);
 // TODO: use directly -f data with ffmpeg native binding
 const child = spawn(
