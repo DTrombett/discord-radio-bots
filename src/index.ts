@@ -1,207 +1,240 @@
+import { REST } from "@discordjs/rest";
 import {
-	AudioPlayerStatus,
-	createAudioPlayer,
-	createAudioResource,
 	entersState,
 	joinVoiceChannel,
-	NoSubscriberBehavior,
-	StreamType,
 	VoiceConnectionStatus,
-	type AudioPlayer,
-	type AudioPlayerState,
+	type VoiceConnection,
 } from "@discordjs/voice";
 import {
+	CompressionMethod,
+	WebSocketManager,
+	WebSocketShardEvents,
+} from "@discordjs/ws";
+import {
 	ActivityType,
-	Client,
-	Collection,
+	APIVersion,
 	ComponentType,
-	Events,
+	GatewayDispatchEvents,
 	GatewayIntentBits,
-	LimitedCollection,
+	GatewayOpcodes,
 	MessageFlags,
-	Partials,
+	PresenceUpdateStatus,
 	Routes,
-} from "discord.js";
+	type GatewayDispatchPayload,
+	type RESTGetAPIChannelMessagesResult,
+	type RESTPatchAPIChannelMessageJSONBody,
+	type RESTPostAPIChannelMessageJSONBody,
+	type RESTPostAPIChannelMessageResult,
+} from "discord-api-types/v10";
 import { decode } from "html-entities";
-import { ok } from "node:assert/strict";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { env, exit, loadEnvFile } from "node:process";
-import type { Readable } from "node:stream";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { env, loadEnvFile } from "node:process";
+import { pipeline } from "node:stream/promises";
+import prism from "prism-media";
 
+console.time("Ready");
 loadEnvFile();
-let child: ChildProcessByStdio<null, Readable, null> | undefined;
-const attachRecorder = <T extends AudioPlayer>(player: T): T => {
-	if (child) return cleanPlayer(player);
-	child = spawn(
-		"ffmpeg",
-		[
-			// "-loglevel",
-			// "warning",
-			"-hide_banner",
-			"-nostats",
-			"-i",
-			"https://icstream.rds.radio/rds",
-			"-analyzeduration",
-			"0",
-			"-acodec",
-			"libopus",
-			"-f",
-			"opus",
-			"-ar",
-			"48000",
-			"-ac",
-			"2",
-			"-b:a",
-			"256k",
-			"-map_metadata",
-			"-1",
-			"pipe:1",
-		],
-		{ stdio: ["ignore", "pipe", "inherit"] },
-	);
-	player.play(
-		createAudioResource(child.stdout, { inputType: StreamType.OggOpus }),
-	);
-	console.log("Recorder attached!");
-	return player;
-};
-const cleanPlayer = <T extends AudioPlayer>(player: T): T => {
-	if (!child) return player;
-	console.log("Playback has stopped. Attempting to restart...");
-	child?.kill();
-	child = undefined;
-	attachRecorder(player);
-	return player;
-};
-const listener = ({}: AudioPlayerState, newState: AudioPlayerState) => {
-	if (newState.status === AudioPlayerStatus.Idle) cleanPlayer(player);
-};
-
-const player = attachRecorder(
-	createAudioPlayer({
-		behaviors: { noSubscriber: NoSubscriberBehavior.Play },
-	}),
-).on("stateChange", listener);
-const client = new Client({
-	intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
-	allowedMentions: { parse: [] },
-	partials: [
-		Partials.Channel,
-		Partials.GuildMember,
-		Partials.GuildScheduledEvent,
-		Partials.Message,
-		Partials.Poll,
-		Partials.PollAnswer,
-		Partials.Reaction,
-		Partials.SoundboardSound,
-		Partials.ThreadMember,
-		Partials.User,
+const rest = new REST({
+	version: APIVersion,
+	hashSweepInterval: 0,
+	handlerSweepInterval: 0,
+}).setToken(env["DISCORD_TOKEN"]!);
+// TODO: use directly -f data with ffmpeg native binding
+const child = spawn(
+	"ffmpeg",
+	[
+		"-loglevel",
+		"warning",
+		"-hide_banner",
+		"-nostats",
+		"-i",
+		"https://icstream.rds.radio/rds",
+		"-analyzeduration",
+		"0",
+		"-map",
+		"0:a:0",
+		"-map_metadata",
+		"-1",
+		"-acodec",
+		"libopus",
+		"-f",
+		"opus",
+		"-ar",
+		"48k",
+		"-ac",
+		"2",
+		"-b:a",
+		"256k",
+		"pipe:1",
 	],
-	makeCache: (manager) =>
-		[
-			"GuildManager",
-			"ChannelManager",
-			"GuildChannelManager",
-			"RoleManager",
-			"PermissionOverwriteManager",
-		].includes(manager.name)
-			? new Collection()
-			: new LimitedCollection<string, any>({ maxSize: 0 }),
-}).once(Events.ClientReady, async (client) => {
-	const channel = client.channels.cache.get(env.CHANNEL_ID!)!;
-	ok("guild" in channel);
-	const connection = joinVoiceChannel({
-		adapterCreator: channel.guild.voiceAdapterCreator,
-		channelId: env.CHANNEL_ID!,
-		guildId: channel.guildId,
-	});
-
-	process.prependOnceListener("SIGINT", () => {
-		console.log("Stopping playback...");
-		child?.kill("SIGINT");
-		player.off("stateChange", listener);
-		player.stop(true);
-		console.log("Disconnecting...");
-		connection.disconnect();
-		connection.destroy();
-	});
-	connection.subscribe(player);
-	await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-	console.log("Ready!");
+	{ stdio: ["ignore", "pipe", "inherit"] },
+);
+const manager = new WebSocketManager({
+	compression: CompressionMethod.ZlibNative,
+	handshakeTimeout: 20_000,
+	helloTimeout: 20_000,
+	intents: GatewayIntentBits.GuildVoiceStates,
+	largeThreshold: 50,
+	readyTimeout: 20_000,
+	rest,
+	token: env["DISCORD_TOKEN"]!,
 });
+const stream = new prism.opus.OggDemuxer().resume();
+let connection: VoiceConnection;
 let id: string;
+let lastMessageId: string | undefined;
+let timeout: NodeJS.Timeout;
 
-process.once("SIGINT", async () => {
-	console.log("Destroying client...");
-	await client.destroy();
-	console.log("Exiting...");
-	exit();
+pipeline(child.stdout, stream);
+child.unref();
+console.log("Connecting...");
+manager.connect();
+[
+	[
+		{
+			user: { id },
+		},
+	],
+	lastMessageId,
+] = await Promise.all([
+	once(manager, WebSocketShardEvents.Ready),
+	rest
+		.get(Routes.channelMessages(env["CHANNEL_ID"]!), {
+			query: new URLSearchParams({ limit: "1" }),
+		})
+		.then((value) => (value as RESTGetAPIChannelMessagesResult)[0]?.id),
+]);
+connection = joinVoiceChannel({
+	adapterCreator: (methods) => {
+		const listener = (payload: GatewayDispatchPayload) => {
+			if (payload.t === GatewayDispatchEvents.VoiceServerUpdate)
+				methods.onVoiceServerUpdate(payload.d);
+			else if (
+				payload.t === GatewayDispatchEvents.VoiceStateUpdate &&
+				payload.d.user_id === id &&
+				payload.d.guild_id === env["GUILD_ID"]!
+			)
+				methods.onVoiceStateUpdate(payload.d);
+		};
+
+		manager.on(WebSocketShardEvents.Dispatch, listener);
+		return {
+			sendPayload: (payload) => {
+				manager.send(0, payload);
+				return true;
+			},
+			destroy: () => manager.off(WebSocketShardEvents.Dispatch, listener),
+		};
+	},
+	channelId: env["CHANNEL_ID"]!,
+	guildId: env["GUILD_ID"]!,
 });
-setInterval(async () => {
-	try {
-		if (!client.isReady()) return;
-		const xml = await fetch("https://icstream.rds.radio/rds.xspf").then((res) =>
-			res.text(),
-		);
-		const [, title, artist, year, newId] =
-			xml.match(/<title>([^<]+)<\/title>/)?.[1]?.split("*") ?? [];
+console.log("Joining voice channel...");
+[lastMessageId] = await Promise.all([
+	lastMessageId ??
+		rest
+			.post(Routes.channelMessages(env["CHANNEL_ID"]!), {
+				body: {
+					flags: MessageFlags.IsComponentsV2,
+					components: [{ type: ComponentType.TextDisplay, content: "_ _" }],
+				} satisfies RESTPostAPIChannelMessageJSONBody,
+			})
+			.then((res) => (res as RESTPostAPIChannelMessageResult).id),
+	entersState(
+		connection,
+		VoiceConnectionStatus.Ready,
+		AbortSignal.timeout(20_000),
+	),
+]);
+stream.on("data", (packet) => {
+	const { state } = connection;
+	if (state.status !== VoiceConnectionStatus.Ready) return;
+	const { networking } = state;
 
-		if (newId === id) return;
-		id = newId;
-		const state = `${decode(title)}${artist ? ` - ${decode(artist)}` : ""}${
-			year ? ` (${year})` : ""
-		}`;
-		client.user.presence.set({
-			activities: [
-				{
-					name: "RDS",
-					type: ActivityType.Listening,
-					url: "https://rds.it",
-					state,
-				},
-			],
-		});
-		const channel = client.channels.cache.get(env.CHANNEL_ID!)!;
-		const url = new URL("https://cdnapi.rds.it/v2/site/get_song");
-		url.search = `idsong=${id}`;
-		const data = await fetch(url).then((res) => res.json());
-
-		await ("lastMessageId" in channel && channel.lastMessageId
-			? client.rest.patch.bind(
-					client.rest,
-					Routes.channelMessage(env.CHANNEL_ID!, channel.lastMessageId),
-			  )
-			: client.rest.post.bind(
-					client.rest,
-					Routes.channelMessages(env.CHANNEL_ID!),
-			  ))({
-			body: {
-				flags: MessageFlags.IsComponentsV2,
-				components: [
-					{
-						type: ComponentType.Section,
-						components: [
+	networking.prepareAudioPacket(packet);
+	networking.dispatchAudio();
+});
+timeout = setInterval<[{ id: string | undefined }]>(
+	async (args) => {
+		try {
+			const xml = await fetch("https://icstream.rds.radio/rds.xspf").then(
+				(res) => res.text(),
+			);
+			const [, title, artist, year, newId] =
+				xml.match(/<title>([^<]+)<\/title>/)?.[1]?.split("*") ?? [];
+			if (newId === args.id) return;
+			args.id = newId;
+			const state = `${decode(title)}${artist ? ` - ${decode(artist)}` : ""}${
+				year ? ` (${year})` : ""
+			}`;
+			const [res] = await Promise.all([
+				fetch(`https://cdnapi.rds.it/v2/site/get_song?idsong=${id}`),
+				manager.send(0, {
+					op: GatewayOpcodes.PresenceUpdate,
+					d: {
+						activities: [
 							{
-								type: ComponentType.TextDisplay,
-								content: `# ${state}\n${
-									data.data.lyrics !== "none" ? data.data.lyrics ?? "" : ""
-								}`,
+								name: "RDS",
+								type: ActivityType.Listening,
+								url: "https://rds.it",
+								state,
 							},
 						],
-						accessory: {
-							type: ComponentType.Thumbnail,
-							media: {
-								url: data.data.id
-									? data.data.music_log_cover_full
-									: "https://web.rds.it/m/i",
-							},
-						},
+						afk: false,
+						since: null,
+						status: PresenceUpdateStatus.Online,
 					},
-				],
-			},
-		});
-	} catch (error) {
-		console.error(error);
-	}
-}, 5_000);
-await client.login();
+				}),
+			]);
+			const data = (await res.json()) as {
+				data: { lyrics?: string; id: number; music_log_cover_full: string };
+			};
+
+			await rest.patch(
+				Routes.channelMessage(env["CHANNEL_ID"]!, lastMessageId),
+				{
+					body: {
+						flags: MessageFlags.IsComponentsV2,
+						allowed_mentions: { parse: [] },
+						components: [
+							{
+								type: ComponentType.Section,
+								components: [
+									{
+										type: ComponentType.TextDisplay,
+										content: `# ${state}\n${
+											data.data.lyrics !== "none" ? data.data.lyrics ?? "" : ""
+										}`,
+									},
+								],
+								accessory: {
+									type: ComponentType.Thumbnail,
+									media: {
+										url: data.data.id
+											? data.data.music_log_cover_full
+											: "https://web.rds.it/m/i",
+									},
+								},
+							},
+						],
+					} satisfies RESTPatchAPIChannelMessageJSONBody,
+				},
+			);
+		} catch (err) {
+			console.error(err);
+		}
+	},
+	5_000,
+	{ id: undefined },
+).unref();
+process.once("SIGINT", () => {
+	console.log("Exiting...");
+	clearInterval(timeout);
+	child.kill("SIGINT");
+	connection.disconnect();
+	connection.destroy();
+	manager.destroy();
+	process.exitCode = 0;
+});
+console.timeEnd("Ready");
