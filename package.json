@@ -24,7 +24,7 @@
 	},
 	"scripts": {
 		"build": "node esbuild.ts",
-		"start": "node --inspect --enable-source-maps .",
+		"start": "npm run build && node --inspect --enable-source-maps .",
 		"test": "tsc"
 	},
 	"dependencies": {

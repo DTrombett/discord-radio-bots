@@ -19,6 +19,7 @@ import {
 	GatewayOpcodes,
 	MessageFlags,
 	PresenceUpdateStatus,
+	RouteBases,
 	Routes,
 	type GatewayDispatchPayload,
 	type RESTGetAPIChannelMessagesResult,
@@ -36,11 +37,6 @@ import { opus } from "prism-media";
 
 time("Ready");
 loadEnvFile();
-const rest = new REST({
-	handlerSweepInterval: 0,
-	hashSweepInterval: 0,
-	version: APIVersion,
-}).setToken(env["DISCORD_TOKEN"]!);
 // TODO: use directly -f data with ffmpeg native binding
 const child = spawn(
 	"ffmpeg",
@@ -78,7 +74,11 @@ const manager = new WebSocketManager({
 	intents: GatewayIntentBits.GuildVoiceStates,
 	largeThreshold: 50,
 	readyTimeout: 20_000,
-	rest,
+	rest: new REST({
+		handlerSweepInterval: 0,
+		hashSweepInterval: 0,
+		version: APIVersion,
+	}).setToken(env["DISCORD_TOKEN"]!),
 	token: env["DISCORD_TOKEN"]!,
 });
 const stream = new opus.OggDemuxer().resume();
@@ -100,10 +100,13 @@ manager.connect();
 	lastMessageId,
 ] = await Promise.all([
 	once(manager, WebSocketShardEvents.Ready),
-	rest
-		.get(Routes.channelMessages(env["CHANNEL_ID"]!), {
-			query: new URLSearchParams({ limit: "1" }),
-		})
+	fetch(
+		RouteBases.api + Routes.channelMessages(env["CHANNEL_ID"]!) + "?limit=1",
+		{
+			headers: { Authorization: `Bot ${env["DISCORD_TOKEN"]!}` },
+		},
+	)
+		.then((res) => res.json())
 		.then((value) => (value as RESTGetAPIChannelMessagesResult)[0]?.id),
 ]);
 connection = joinVoiceChannel({
@@ -134,13 +137,18 @@ connection = joinVoiceChannel({
 log("Joining voice channel...");
 [lastMessageId] = await Promise.all([
 	lastMessageId ??
-		rest
-			.post(Routes.channelMessages(env["CHANNEL_ID"]!), {
-				body: {
-					flags: MessageFlags.IsComponentsV2,
-					components: [{ type: ComponentType.TextDisplay, content: "_ _" }],
-				} satisfies RESTPostAPIChannelMessageJSONBody,
-			})
+		fetch(RouteBases.api + Routes.channelMessages(env["CHANNEL_ID"]!), {
+			body: JSON.stringify({
+				flags: MessageFlags.IsComponentsV2,
+				components: [{ type: ComponentType.TextDisplay, content: "_ _" }],
+			} satisfies RESTPostAPIChannelMessageJSONBody),
+			method: "POST",
+			headers: {
+				"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
+				"Content-Type": "application/json",
+			},
+		})
+			.then((res) => res.json())
 			.then((res) => (res as RESTPostAPIChannelMessageResult).id),
 	entersState(
 		connection,
@@ -159,9 +167,10 @@ stream.on("data", (packet) => {
 timeout = setInterval<[{ id: string | undefined }]>(
 	async (args) => {
 		try {
-			const xml = await fetch("https://icstream.rds.radio/rds.xspf").then(
-				(res) => res.text(),
-			);
+			let res = await fetch("https://icstream.rds.radio/rds.xspf");
+			if (!res.ok)
+				throw new Error(`Fetch failed with ${res.status} ${res.statusText}`);
+			const xml = await res.text();
 			const [, title, artist, year, newId] =
 				xml.match(/<title>([^<]+)<\/title>/)?.[1]?.split("*") ?? [];
 			if (newId === args.id) return;
@@ -169,7 +178,8 @@ timeout = setInterval<[{ id: string | undefined }]>(
 			const state = `${decode(title)}${artist ? ` - ${decode(artist)}` : ""}${
 				year ? ` (${year})` : ""
 			}`;
-			const [res] = await Promise.all([
+
+			[res] = await Promise.all([
 				fetch(`https://cdnapi.rds.it/v2/site/get_song?idsong=${id}`),
 				manager.send(0, {
 					op: GatewayOpcodes.PresenceUpdate,
@@ -188,14 +198,21 @@ timeout = setInterval<[{ id: string | undefined }]>(
 					},
 				}),
 			]);
+			if (!res.ok)
+				throw new Error(`Fetch failed with ${res.status} ${res.statusText}`);
 			const data = (await res.json()) as {
 				data: { lyrics?: string; id: number; music_log_cover_full: string };
 			};
-
-			await rest.patch(
-				Routes.channelMessage(env["CHANNEL_ID"]!, lastMessageId),
+			res = await fetch(
+				RouteBases.api +
+					Routes.channelMessage(env["CHANNEL_ID"]!, lastMessageId),
 				{
-					body: {
+					method: "PATCH",
+					headers: {
+						"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
 						flags: MessageFlags.IsComponentsV2,
 						allowed_mentions: { parse: [] },
 						components: [
@@ -219,9 +236,11 @@ timeout = setInterval<[{ id: string | undefined }]>(
 								},
 							},
 						],
-					} satisfies RESTPatchAPIChannelMessageJSONBody,
+					} satisfies RESTPatchAPIChannelMessageJSONBody),
 				},
 			);
+			if (!res.ok)
+				throw new Error(`Fetch failed with ${res.status} ${res.statusText}`);
 		} catch (err) {
 			error(err);
 		}
