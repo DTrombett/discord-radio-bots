@@ -1,0 +1,23 @@
+{
+  "name": "voice-bot-test",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "DTrombett",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.0",
+    "@snazzah/davey": "^0.1.9",
+    "discord.js": "^14.25.1",
+    "html-entities": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3"
+  }
+}
