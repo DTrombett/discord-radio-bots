@@ -15,6 +15,9 @@
 	"bugs": {
 		"url": "https://github.com/dtrombett/discord-radio-bots/issues"
 	},
+	"engines": {
+		"node": ">=24"
+	},
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/dtrombett/discord-radio-bots.git"
