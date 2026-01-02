@@ -28,12 +28,13 @@ import {
 } from "discord-api-types/v10";
 import { decode } from "html-entities";
 import { spawn } from "node:child_process";
+import { error, log, time, timeEnd } from "node:console";
 import { once } from "node:events";
 import { env, loadEnvFile } from "node:process";
 import { pipeline } from "node:stream/promises";
-import prism from "prism-media";
+import { opus } from "prism-media";
 
-console.time("Ready");
+time("Ready");
 loadEnvFile();
 const rest = new REST({
 	version: APIVersion,
@@ -80,7 +81,7 @@ const manager = new WebSocketManager({
 	rest,
 	token: env["DISCORD_TOKEN"]!,
 });
-const stream = new prism.opus.OggDemuxer().resume();
+const stream = new opus.OggDemuxer().resume();
 let connection: VoiceConnection;
 let id: string;
 let lastMessageId: string | undefined;
@@ -88,7 +89,7 @@ let timeout: NodeJS.Timeout;
 
 pipeline(child.stdout, stream);
 child.unref();
-console.log("Connecting...");
+log("Connecting...");
 manager.connect();
 [
 	[
@@ -130,7 +131,7 @@ connection = joinVoiceChannel({
 	channelId: env["CHANNEL_ID"]!,
 	guildId: env["GUILD_ID"]!,
 });
-console.log("Joining voice channel...");
+log("Joining voice channel...");
 [lastMessageId] = await Promise.all([
 	lastMessageId ??
 		rest
@@ -222,19 +223,18 @@ timeout = setInterval<[{ id: string | undefined }]>(
 				},
 			);
 		} catch (err) {
-			console.error(err);
+			error(err);
 		}
 	},
 	5_000,
 	{ id: undefined },
 ).unref();
 process.once("SIGINT", () => {
-	console.log("Exiting...");
+	log("Exiting...");
 	clearInterval(timeout);
 	child.kill("SIGINT");
 	connection.disconnect();
 	connection.destroy();
 	manager.destroy();
-	process.exitCode = 0;
 });
-console.timeEnd("Ready");
+timeEnd("Ready");
