@@ -19,7 +19,6 @@ import {
 	GatewayOpcodes,
 	MessageFlags,
 	PresenceUpdateStatus,
-	RouteBases,
 	Routes,
 	type GatewayDispatchPayload,
 	type RESTGetAPIChannelMessagesResult,
@@ -34,9 +33,14 @@ import { once } from "node:events";
 import { env, loadEnvFile } from "node:process";
 import { pipeline } from "node:stream/promises";
 import { opus } from "prism-media";
+import { Client, type Dispatcher } from "undici";
 
 time("Ready");
 loadEnvFile();
+const client = new Client("https://discord.com", {
+	allowH2: true,
+	headersTimeout: 20_000,
+});
 // TODO: use directly -f data with ffmpeg native binding
 const child = spawn(
 	"ffmpeg",
@@ -78,6 +82,7 @@ const manager = new WebSocketManager({
 		handlerSweepInterval: 0,
 		hashSweepInterval: 0,
 		version: APIVersion,
+		agent: client,
 	}).setToken(env["DISCORD_TOKEN"]!),
 	token: env["DISCORD_TOKEN"]!,
 });
@@ -100,13 +105,14 @@ manager.connect();
 	lastMessageId,
 ] = await Promise.all([
 	once(manager, WebSocketShardEvents.Ready),
-	fetch(
-		RouteBases.api + Routes.channelMessages(env["CHANNEL_ID"]!) + "?limit=1",
-		{
+	client
+		.request({
+			method: "GET",
+			path: `/api/v${APIVersion}${Routes.channelMessages(env["CHANNEL_ID"]!)}`,
 			headers: { Authorization: `Bot ${env["DISCORD_TOKEN"]!}` },
-		},
-	)
-		.then((res) => res.json())
+			query: { limit: 1 },
+		})
+		.then((res) => res.body.json())
 		.then((value) => (value as RESTGetAPIChannelMessagesResult)[0]?.id),
 ]);
 connection = joinVoiceChannel({
@@ -137,18 +143,22 @@ connection = joinVoiceChannel({
 log("Joining voice channel...");
 [lastMessageId] = await Promise.all([
 	lastMessageId ??
-		fetch(RouteBases.api + Routes.channelMessages(env["CHANNEL_ID"]!), {
-			body: JSON.stringify({
-				flags: MessageFlags.IsComponentsV2,
-				components: [{ type: ComponentType.TextDisplay, content: "_ _" }],
-			} satisfies RESTPostAPIChannelMessageJSONBody),
-			method: "POST",
-			headers: {
-				"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
-				"Content-Type": "application/json",
-			},
-		})
-			.then((res) => res.json())
+		client
+			.request({
+				method: "POST",
+				path: `/api/v${APIVersion}${Routes.channelMessages(
+					env["CHANNEL_ID"]!,
+				)}`,
+				body: JSON.stringify({
+					flags: MessageFlags.IsComponentsV2,
+					components: [{ type: ComponentType.TextDisplay, content: "_ _" }],
+				} satisfies RESTPostAPIChannelMessageJSONBody),
+				headers: {
+					"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
+					"Content-Type": "application/json",
+				},
+			})
+			.then((res) => res.body.json())
 			.then((res) => (res as RESTPostAPIChannelMessageResult).id),
 	entersState(
 		connection,
@@ -167,7 +177,9 @@ stream.on("data", (packet) => {
 timeout = setInterval<[{ id: string | undefined }]>(
 	async (args) => {
 		try {
-			let res = await fetch("https://icstream.rds.radio/rds.xspf");
+			let res: Response | Dispatcher.ResponseData = await fetch(
+				"https://icstream.rds.radio/rds.xspf",
+			);
 			if (!res.ok)
 				throw new Error(`Fetch failed with ${res.status} ${res.statusText}`);
 			const xml = await res.text();
@@ -203,44 +215,46 @@ timeout = setInterval<[{ id: string | undefined }]>(
 			const data = (await res.json()) as {
 				data: { lyrics?: string; id: number; music_log_cover_full: string };
 			};
-			res = await fetch(
-				RouteBases.api +
-					Routes.channelMessage(env["CHANNEL_ID"]!, lastMessageId),
-				{
-					method: "PATCH",
-					headers: {
-						"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
-						"Content-Type": "application/json",
-					},
-					body: JSON.stringify({
-						flags: MessageFlags.IsComponentsV2,
-						allowed_mentions: { parse: [] },
-						components: [
-							{
-								type: ComponentType.Section,
-								components: [
-									{
-										type: ComponentType.TextDisplay,
-										content: `# ${state}\n${
-											data.data.lyrics !== "none" ? data.data.lyrics ?? "" : ""
-										}`,
-									},
-								],
-								accessory: {
-									type: ComponentType.Thumbnail,
-									media: {
-										url: data.data.id
-											? data.data.music_log_cover_full
-											: "https://web.rds.it/m/i",
-									},
+			res = await client.request({
+				path: `/api/v${APIVersion}${Routes.channelMessage(
+					env["CHANNEL_ID"]!,
+					lastMessageId,
+				)}`,
+				method: "PATCH",
+				headers: {
+					"Authorization": `Bot ${env["DISCORD_TOKEN"]!}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					flags: MessageFlags.IsComponentsV2,
+					allowed_mentions: { parse: [] },
+					components: [
+						{
+							type: ComponentType.Section,
+							components: [
+								{
+									type: ComponentType.TextDisplay,
+									content: `# ${state}\n${
+										data.data.lyrics !== "none" ? data.data.lyrics ?? "" : ""
+									}`,
+								},
+							],
+							accessory: {
+								type: ComponentType.Thumbnail,
+								media: {
+									url: data.data.id
+										? data.data.music_log_cover_full
+										: "https://web.rds.it/m/i",
 								},
 							},
-						],
-					} satisfies RESTPatchAPIChannelMessageJSONBody),
-				},
-			);
-			if (!res.ok)
-				throw new Error(`Fetch failed with ${res.status} ${res.statusText}`);
+						},
+					],
+				} satisfies RESTPatchAPIChannelMessageJSONBody),
+			});
+			if (res.statusCode !== 200)
+				throw new Error(`Fetch failed with ${res.statusCode}`, {
+					cause: await res.body.text(),
+				});
 		} catch (err) {
 			error(err);
 		}
