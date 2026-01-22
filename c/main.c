@@ -1,6 +1,5 @@
 #include "utils.h"
 #include <assert.h>
-#include <corecrt_search.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
@@ -22,50 +21,84 @@ static inline void writePacket(AVPacket *pkt) {
   }
   av_packet_unref(pkt);
 }
+static inline void printDict(const AVDictionary *m) {
+  int err;
+  char *entries;
+
+  CHECK_ERR(av_dict_get_string(m, &entries, ':', '\n'),
+            "Failed to obtain dict entries");
+  if (*entries != 0)
+    printf("%s\n", entries);
+}
+static inline void openInput(AVFormatContext *ic, char *url) {
+  int err;
+  AVDictionary *options = NULL;
+
+  ic->skip_estimate_duration_from_pts = 1;
+  CHECK_ERR(av_dict_set(&options, "reconnect", "1", 0),
+            "Couldn't set reconnect option");
+  CHECK_ERR(av_dict_set(&options, "reconnect_at_eof", "1", 0),
+            "Couldn't set reconnect at eof option");
+  CHECK_ERR(av_dict_set(&options, "reconnect_on_network_error", "1", 0),
+            "Couldn't set reconnect on network error option");
+  CHECK_ERR(av_dict_set(&options, "reconnect_streamed", "1", 0),
+            "Couldn't set reconnect streamed option");
+  CHECK_ERR(av_dict_set(&options, "reconnect_max_retries", "4", 0),
+            "Couldn't set reconnect max retries option");
+  CHECK_ERR(avformat_open_input(&ic, url, NULL, &options),
+            "Could not open input");
+  if (av_dict_count(options) > 0) {
+    printf("Couldn't set invalid format options:\n");
+    printDict(options);
+    exit(1);
+  }
+}
+static inline void findAudioStream(AVFormatContext *ic, int *streamNumber,
+                                   AVCodecContext **decoderContext) {
+  int err;
+  const AVCodec *decoder;
+
+  CHECK_ERR(avformat_find_stream_info(ic, NULL), "Could not find stream info");
+  CHECK_ERR(*streamNumber = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, -1, -1,
+                                                &decoder, 0),
+            "Couldn't find an audio stream");
+  printf("Found stream %d (%s)\n", *streamNumber, decoder->long_name);
+
+  // Log stream metadata
+  printDict(ic->streams[*streamNumber]->metadata);
+  printDict(ic->metadata);
+
+  // Open decoder
+  assert(*decoderContext = avcodec_alloc_context3(decoder));
+  CHECK_ERR(avcodec_parameters_to_context(*decoderContext,
+                                          ic->streams[*streamNumber]->codecpar),
+            "Could not copy decoder params");
+  CHECK_ERR(avcodec_open2(*decoderContext, decoder, NULL),
+            "Could not open decoder");
+}
 DWORD WINAPI ffmpegThread(LPVOID url) {
   int err, streamNumber;
   int64_t pts = 0;
-  const AVCodec *decoder, *encoder = avcodec_find_encoder_by_name("libopus");
   AVCodecContext *decoderContext,
-      *encoderContext = avcodec_alloc_context3(encoder);
+      *encoderContext =
+          avcodec_alloc_context3(avcodec_find_encoder_by_name("libopus"));
   AVFrame *inputFrame = av_frame_alloc(), *outputFrame = av_frame_alloc();
   AVFormatContext *ic = avformat_alloc_context();
   AVPacket *pkt = av_packet_alloc();
   SwrContext *s = NULL;
 
   // Initialize
-  av_log_set_level(AV_LOG_INFO);
-  assert(pkt && inputFrame && outputFrame && encoder && ic && encoderContext);
+  av_log_set_level(AV_LOG_DEBUG);
+  assert(pkt && inputFrame && outputFrame && ic);
+  printf("Opening input");
 
   // Open input
-  ic->skip_estimate_duration_from_pts = 1;
-  CHECK_ERR(avformat_open_input(&ic, url, NULL, NULL), "Could not open input");
+  openInput(ic, url);
   printf("Opened input %s\n", (char *)url);
   free(url);
 
   // Find audio stream
-  CHECK_ERR(avformat_find_stream_info(ic, NULL), "Could not find stream info");
-  CHECK_ERR(streamNumber = av_find_best_stream(ic, AVMEDIA_TYPE_AUDIO, -1, -1,
-                                               &decoder, 0),
-            "Couldn't find an audio stream");
-  printf("Found stream %d (%s)\n", streamNumber, decoder->long_name);
-  {
-    const AVDictionaryEntry *prev = NULL;
-
-    while ((prev = av_dict_iterate(ic->streams[streamNumber]->metadata, prev)))
-      printf("%s = %s\n", prev->key, prev->value);
-    prev = NULL;
-    while ((prev = av_dict_iterate(ic->metadata, prev)))
-      printf("%s = %s\n", prev->key, prev->value);
-  }
-
-  // Open decoder
-  assert(decoderContext = avcodec_alloc_context3(decoder));
-  CHECK_ERR(avcodec_parameters_to_context(decoderContext,
-                                          ic->streams[streamNumber]->codecpar),
-            "Could not copy decoder params");
-  CHECK_ERR(avcodec_open2(decoderContext, decoder, NULL),
-            "Could not open decoder");
+  findAudioStream(ic, &streamNumber, &decoderContext);
   printf("Bitrate: %lld\nSample rate: %d\nChannels: %d\nTime base: "
          "%d/%d\nSample format: %d\n",
          decoderContext->bit_rate, decoderContext->sample_rate,
@@ -94,7 +127,7 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
   printf("Initialized resampler\n");
 
   // Open encoder
-  CHECK_ERR(avcodec_open2(encoderContext, encoder, NULL),
+  CHECK_ERR(avcodec_open2(encoderContext, NULL, NULL),
             "Could not open encoder");
   printf("Opened encoder\n");
 

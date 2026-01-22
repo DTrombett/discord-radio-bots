@@ -30,7 +30,7 @@ import { Client } from "undici";
 
 time("Ready");
 loadEnvFile();
-const client = new Client("https://discord.com", {
+const agent = new Client("https://discord.com", {
 	allowH2: true,
 	headersTimeout: 20_000,
 });
@@ -45,7 +45,7 @@ const manager = new WebSocketManager({
 		handlerSweepInterval: 0,
 		hashSweepInterval: 0,
 		version: APIVersion,
-		agent: client,
+		agent,
 	}).setToken(env["DISCORD_TOKEN"]!),
 	token: env["DISCORD_TOKEN"]!,
 });
@@ -66,7 +66,7 @@ manager.connect();
 	lastMessageId,
 ] = await Promise.all([
 	once(manager, WebSocketShardEvents.Ready),
-	client
+	agent
 		.request({
 			method: "GET",
 			path: `/api/v${APIVersion}${Routes.channelMessages(env["CHANNEL_ID"]!)}`,
@@ -104,7 +104,7 @@ connection = joinVoiceChannel({
 log("Joining voice channel...");
 [lastMessageId] = await Promise.all([
 	lastMessageId ??
-		client
+		agent
 			.request({
 				method: "POST",
 				path: `/api/v${APIVersion}${Routes.channelMessages(
