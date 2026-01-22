@@ -37,7 +37,7 @@
 		"discord-api-types": "^0.38.37",
 		"html-entities": "^2.6.0",
 		"node": "^24.13.0",
-		"undici": "^6.23.0"
+		"undici": "^7.18.2"
 	},
 	"devDependencies": {
 		"@tsconfig/node-lts": "^24.0.0",
