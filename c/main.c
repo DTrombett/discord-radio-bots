@@ -1,5 +1,6 @@
 #include "utils.h"
 #include <assert.h>
+#include <corecrt_search.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
@@ -112,8 +113,14 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
 
     // Receive decoded frames
     while ((err = avcodec_receive_frame(decoderContext, inputFrame)) >= 0) {
-      while ((err = swr_get_out_samples(s, inputFrame->nb_samples)) >=
-             encoderContext->frame_size) {
+      // Send frames to resampler
+      CHECK_ERR(swr_convert(s, NULL, 0,
+                            (const uint8_t **)inputFrame->extended_data,
+                            inputFrame->nb_samples),
+                "Error sending frame to resampler");
+      av_frame_unref(inputFrame);
+
+      while ((err = swr_get_out_samples(s, 0)) >= encoderContext->frame_size) {
         // Set resampled frame parameters
         outputFrame->format = encoderContext->sample_fmt;
         outputFrame->nb_samples = encoderContext->frame_size;
@@ -122,14 +129,11 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
         av_channel_layout_copy(&outputFrame->ch_layout,
                                &encoderContext->ch_layout);
 
-        // Resample
+        // Read resampled frames
         CHECK_ERR(av_frame_get_buffer(outputFrame, 0), "Failed to get buffer");
         CHECK_ERR(swr_convert(s, outputFrame->extended_data,
-                              outputFrame->nb_samples,
-                              (const uint8_t **)inputFrame->extended_data,
-                              inputFrame->nb_samples),
+                              outputFrame->nb_samples, NULL, 0),
                   "Resampling failed");
-        av_frame_unref(inputFrame);
 
         // Encode frame
         CHECK_ERR(avcodec_send_frame(encoderContext, outputFrame),
@@ -141,8 +145,6 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
         while ((err = avcodec_receive_packet(encoderContext, pkt)) >= 0)
           writePacket(pkt);
       }
-      if (inputFrame->nb_samples > 0)
-        printf("WARNING: Unused %d input samples", inputFrame->nb_samples);
     }
     if (err != AVERROR(EAGAIN))
       CHECK_ERR(err, "Failed to recode frame");
