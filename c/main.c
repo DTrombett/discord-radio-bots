@@ -9,7 +9,16 @@
 #include <node_api.h>
 #include <windows.h>
 
+#define BITRATE 383000
+#define BUFFERING_TIME 80
+#define DEFAULT_TIMEOUT 20000
+#define SAMPLE_RATE 48000
+#define TERM_CODE 2033
+
+LARGE_INTEGER freq;
+
 typedef volatile struct {
+  LARGE_INTEGER start;
   char *url;
   HANDLE sem;
   HANDLE thread;
@@ -21,9 +30,18 @@ typedef volatile struct {
 
 static inline void writePacket(AVPacket *pkt, PlaybackState *state) {
   if (!state->paused && !state->stopped) {
+    LARGE_INTEGER now;
+
+    napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
     if (pkt->duration != 960)
       printf("WARNING: unexpected duration %lld\n", pkt->duration);
-    napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
+    QueryPerformanceCounter(&now);
+    if ((now.QuadPart =
+             pkt->pts / (SAMPLE_RATE / 1000) -
+             (now.QuadPart - state->start.QuadPart) * 1000 / freq.QuadPart -
+             BUFFERING_TIME) > 0)
+      Sleep(now.QuadPart);
+    napi_call_threadsafe_function(state->jsPlay, NULL, napi_tsfn_nonblocking);
     WaitForSingleObject(state->sem, INFINITE);
   }
   av_packet_unref(pkt);
@@ -37,7 +55,7 @@ static inline void printDict(const AVDictionary *m) {
   if (*entries != 0)
     printf("%s\n", entries);
 }
-static inline void openInput(AVFormatContext *ic, char *url) {
+static inline void openInput(AVFormatContext *ic, PlaybackState *state) {
   int err;
   AVDictionary *options = NULL;
 
@@ -52,8 +70,11 @@ static inline void openInput(AVFormatContext *ic, char *url) {
             "Couldn't set reconnect streamed option");
   CHECK_ERR(av_dict_set(&options, "reconnect_max_retries", "4", 0),
             "Couldn't set reconnect max retries option");
-  CHECK_ERR(avformat_open_input(&ic, url, NULL, &options),
+  CHECK_ERR(avformat_open_input(&ic, state->url, NULL, &options),
             "Could not open input");
+  QueryPerformanceCounter((LARGE_INTEGER *)&state->start);
+  free(state->url);
+  state->url = NULL;
   if (av_dict_count(options) > 0) {
     printf("Couldn't set invalid format options:\n");
     printDict(options);
@@ -98,13 +119,11 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   // Initialize
   av_log_set_level(AV_LOG_INFO);
   assert(pkt && inputFrame && outputFrame && ic);
-  printf("Opening input\n");
+  printf("Opening input %s\n", state->url);
 
   // Open input
-  openInput(ic, state->url);
-  printf("Opened input %s\n", state->url);
-  free(state->url);
-  state->url = NULL;
+  openInput(ic, state);
+  printf("Opened input\n");
 
   // Find audio stream
   findAudioStream(ic, &streamNumber, &decoderContext);
@@ -115,13 +134,11 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
          decoderContext->time_base.den, decoderContext->sample_fmt);
 
   // Set encoder options
-  encoderContext->bit_rate = 256000;
-  encoderContext->ch_layout.nb_channels = 2;
-  encoderContext->ch_layout.order = AV_CHANNEL_ORDER_NATIVE;
-  encoderContext->ch_layout.u.mask = AV_CH_LAYOUT_STEREO;
+  encoderContext->bit_rate = BITRATE;
+  encoderContext->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
   encoderContext->sample_fmt = AV_SAMPLE_FMT_FLT;
   encoderContext->time_base =
-      (AVRational){1, (encoderContext->sample_rate = 48000)};
+      (AVRational){1, (encoderContext->sample_rate = SAMPLE_RATE)};
   CHECK_ERR(av_opt_set(encoderContext->priv_data, "vbr", "off", 0),
             "Failed to enable cbr");
 
@@ -210,20 +227,27 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   return 0;
 }
 
-static void playOpusPacket(napi_env env, napi_value jsPlayOpusPacket,
-                           void *context, void *data) {
+static void playOpusPacket(napi_env env, napi_value jsFn, void *context,
+                           void *data) {
   PlaybackState *state = context;
-  AVPacket *pkt = data;
   napi_value recv;
-  napi_value buffer;
 
   NODE_API_CALL_DEFAULT(
       napi_get_reference_value(env, state->connection, &recv), );
-  NODE_API_CALL_DEFAULT(napi_create_external_buffer(env, pkt->size, pkt->data,
-                                                    NULL, NULL, &buffer), );
-  NODE_API_CALL_DEFAULT(
-      napi_call_function(env, recv, jsPlayOpusPacket, 1, &buffer, NULL), );
-  ReleaseSemaphore(state->sem, 1, NULL);
+  if (data) {
+    AVPacket *pkt = data;
+    napi_value buffer;
+
+    NODE_API_CALL_DEFAULT(napi_create_external_buffer(env, pkt->size, pkt->data,
+                                                      NULL, NULL, &buffer), );
+    NODE_API_CALL_DEFAULT(
+        napi_get_named_property(env, recv, "prepareAudioPacket", &jsFn), );
+    NODE_API_CALL_DEFAULT(
+        napi_call_function(env, recv, jsFn, 1, &buffer, NULL), );
+  } else {
+    NODE_API_CALL_DEFAULT(napi_call_function(env, recv, jsFn, 0, NULL, NULL), );
+    ReleaseSemaphore(state->sem, 1, NULL);
+  }
 }
 static napi_value destroy(napi_env env, napi_callback_info cbinfo) {
   size_t argc = 2;
@@ -237,10 +261,11 @@ static napi_value destroy(napi_env env, napi_callback_info cbinfo) {
   state->stopped = true;
   state->url = NULL;
   ReleaseSemaphore(state->sem, 1, NULL);
-  if ((WaitForSingleObject(state->thread, parseInt(env, arguments[0], 1,
-                                                   20000)) == WAIT_TIMEOUT) &&
-      parseBool(env, arguments[1], 0))
-    TerminateThread(state->thread, 2033);
+  if ((WaitForSingleObject(state->thread,
+                           parseInt(env, arguments[0], 1, DEFAULT_TIMEOUT)) ==
+       WAIT_TIMEOUT) &&
+      parseBool(env, arguments[1], true))
+    TerminateThread(state->thread, TERM_CODE);
   CloseHandle(state->thread);
   CloseHandle(state->sem);
   NODE_API_CALL(napi_delete_reference(env, state->connection));
@@ -260,11 +285,11 @@ static napi_value stop(napi_env env, napi_callback_info cbinfo) {
   free(state->url);
   state->stopped = true;
   state->url = NULL;
-  ReleaseSemaphore(state->sem, 1, NULL);
-  if ((WaitForSingleObject(state->thread, parseInt(env, arguments[0], 1,
-                                                   20000)) == WAIT_TIMEOUT) &&
-      parseBool(env, arguments[1], 0))
-    TerminateThread(state->thread, 2033);
+  if ((WaitForSingleObject(state->thread,
+                           parseInt(env, arguments[0], 1, DEFAULT_TIMEOUT)) ==
+       WAIT_TIMEOUT) &&
+      parseBool(env, arguments[1], false))
+    TerminateThread(state->thread, TERM_CODE);
   CloseHandle(state->thread);
   state->thread = NULL;
   return UNDEFINED;
@@ -286,7 +311,7 @@ static napi_value play(napi_env env, napi_callback_info cbinfo) {
 static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
   size_t argc = 1;
   napi_value arguments[1];
-  napi_value jsPlayOpusPacket;
+  napi_value dispatchAudio;
   napi_value this;
   PlaybackState *state = malloc(sizeof(PlaybackState));
 
@@ -298,10 +323,10 @@ static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
   NODE_API_CALL(napi_create_reference(env, arguments[0], 1,
                                       (napi_ref *)&state->connection));
-  NODE_API_CALL(napi_get_named_property(env, arguments[0], "playOpusPacket",
-                                        &jsPlayOpusPacket));
+  NODE_API_CALL(napi_get_named_property(env, arguments[0], "dispatchAudio",
+                                        &dispatchAudio));
   NODE_API_CALL(napi_create_threadsafe_function(
-      env, jsPlayOpusPacket, NULL, STRING("playOpusPacket"), 1, 1, NULL, NULL,
+      env, dispatchAudio, NULL, STRING("dispatchAudio"), 2, 1, NULL, NULL,
       (void *)state, playOpusPacket,
       (napi_threadsafe_function *)&state->jsPlay));
   NODE_API_CALL(napi_wrap(env, this, (void *)state, NULL, NULL, NULL));
@@ -315,6 +340,7 @@ NAPI_MODULE_INIT(/* napi_env env, napi_value exports */) {
       {.utf8name = "stop", .method = stop},
       {.utf8name = "destroy", .method = destroy}};
 
+  QueryPerformanceFrequency(&freq);
   NODE_API_CALL(napi_define_class(
       env, "AudioPlayer", NAPI_AUTO_LENGTH, createPlayer, NULL,
       sizeof(properties) / sizeof(properties[0]), properties, &AudioPlayer));
