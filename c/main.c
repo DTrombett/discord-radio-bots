@@ -1,3 +1,4 @@
+#define NAPI_VERSION 10
 #include "utils.h"
 #include <assert.h>
 #include <libavcodec/avcodec.h>
@@ -8,16 +9,22 @@
 #include <node_api.h>
 #include <windows.h>
 
-static napi_threadsafe_function func;
-HANDLE sem;
-volatile char ok = 1;
+typedef struct {
+  char *url;
+  HANDLE sem;
+  HANDLE thread;
+  napi_ref connection;
+  napi_threadsafe_function jsPlay;
+  volatile bool paused;
+  volatile bool stopped;
+} PlaybackState;
 
-static inline void writePacket(AVPacket *pkt) {
-  if (ok) {
+static inline void writePacket(AVPacket *pkt, PlaybackState *state) {
+  if (!state->paused) {
     if (pkt->duration != 960)
       printf("WARNING: unexpected duration %lld\n", pkt->duration);
-    napi_call_threadsafe_function(func, pkt, napi_tsfn_nonblocking);
-    WaitForSingleObject(sem, INFINITE);
+    napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
+    WaitForSingleObject(state->sem, INFINITE);
   }
   av_packet_unref(pkt);
 }
@@ -76,7 +83,8 @@ static inline void findAudioStream(AVFormatContext *ic, int *streamNumber,
   CHECK_ERR(avcodec_open2(*decoderContext, decoder, NULL),
             "Could not open decoder");
 }
-DWORD WINAPI ffmpegThread(LPVOID url) {
+DWORD WINAPI ffmpegThread(LPVOID data) {
+  PlaybackState *state = data;
   int err, streamNumber;
   int64_t pts = 0;
   AVCodecContext *decoderContext,
@@ -90,12 +98,13 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
   // Initialize
   av_log_set_level(AV_LOG_DEBUG);
   assert(pkt && inputFrame && outputFrame && ic);
-  printf("Opening input");
+  printf("Opening input\n");
 
   // Open input
-  openInput(ic, url);
-  printf("Opened input %s\n", (char *)url);
-  free(url);
+  openInput(ic, state->url);
+  printf("Opened input %s\n", state->url);
+  free(state->url);
+  state->url = NULL;
 
   // Find audio stream
   findAudioStream(ic, &streamNumber, &decoderContext);
@@ -132,7 +141,7 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
   printf("Opened encoder\n");
 
   // Read frames
-  while (ok && (err = av_read_frame(ic, pkt)) != AVERROR_EOF) {
+  while (!state->stopped && (err = av_read_frame(ic, pkt)) != AVERROR_EOF) {
     CHECK_ERR(err, "Error reading frame");
     if (pkt->stream_index != streamNumber) {
       av_packet_unref(pkt);
@@ -176,7 +185,7 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
 
         // Receive encoded packets
         while ((err = avcodec_receive_packet(encoderContext, pkt)) >= 0)
-          writePacket(pkt);
+          writePacket(pkt, state);
       }
     }
     if (err != AVERROR(EAGAIN))
@@ -186,7 +195,7 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
   // Flush encoder
   avcodec_send_frame(encoderContext, NULL);
   while (avcodec_receive_packet(encoderContext, pkt) >= 0)
-    writePacket(pkt);
+    writePacket(pkt, state);
 
   // Close and free
   av_frame_free(&inputFrame);
@@ -201,41 +210,87 @@ DWORD WINAPI ffmpegThread(LPVOID url) {
 
 static void playOpusPacket(napi_env env, napi_value jsPlayOpusPacket,
                            void *context, void *data) {
-  napi_value connection;
-  napi_value argv;
+  PlaybackState *state = context;
   AVPacket *pkt = data;
+  napi_value recv;
+  napi_value buffer;
 
-  NODE_API_CALL_DEFAULT(napi_get_reference_value(env, context, &connection), );
-  NODE_API_CALL_DEFAULT(napi_create_external_buffer(env, pkt->size, pkt->data,
-                                                    NULL, NULL, &argv), );
   NODE_API_CALL_DEFAULT(
-      napi_call_function(env, connection, jsPlayOpusPacket, 1, &argv, NULL), );
-  ReleaseSemaphore(sem, 1, NULL);
+      napi_get_reference_value(env, state->connection, &recv), );
+  NODE_API_CALL_DEFAULT(napi_create_external_buffer(env, pkt->size, pkt->data,
+                                                    NULL, NULL, &buffer), );
+  NODE_API_CALL_DEFAULT(
+      napi_call_function(env, recv, jsPlayOpusPacket, 1, &buffer, NULL), );
+  ReleaseSemaphore(state->sem, 1, NULL);
 }
 static napi_value stop(napi_env env, napi_callback_info cbinfo) {
-  ReleaseSemaphore(sem, INFINITE, NULL);
-  ok = 0;
-  NODE_API_CALL(napi_release_threadsafe_function(func, napi_tsfn_abort));
+  size_t argc = 2;
+  napi_value arguments[2];
+  napi_value this;
+  PlaybackState *state;
+
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
+  NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  free(state->url);
+  state->paused = false;
+  state->stopped = true;
+  state->url = NULL;
+  ReleaseSemaphore(state->sem, 1, NULL);
+  if ((WaitForSingleObject(state->thread, parseInt(env, arguments[0], 1,
+                                                   20000)) == WAIT_TIMEOUT) &&
+      parseBool(env, arguments[1], 0))
+    TerminateThread(state->thread, 2033);
+  CloseHandle(state->thread);
+  state->thread = NULL;
   return UNDEFINED;
 }
 static napi_value play(napi_env env, napi_callback_info cbinfo) {
-  NODE_LOAD_ARGUMENTS(2, cbinfo);
-  char *url = parseString(env, arguments[0]);
-  napi_value jsPlayOpusPacket;
-  napi_ref context;
+  size_t argc = 1;
+  napi_value arguments[1];
+  napi_value this;
+  PlaybackState *state;
 
-  NODE_API_CALL(napi_get_named_property(env, arguments[1], "playOpusPacket",
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
+  NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  state->url = parseString(env, arguments[0]);
+  state->paused = false;
+  state->thread = CreateThread(NULL, 0, ffmpegThread, state, 0, NULL);
+  return UNDEFINED;
+}
+static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
+  size_t argc = 1;
+  napi_value arguments[1];
+  napi_value jsPlayOpusPacket;
+  napi_value this;
+  PlaybackState *state = malloc(sizeof(PlaybackState));
+
+  state->paused = false;
+  state->stopped = true;
+  state->thread = NULL;
+  state->url = NULL;
+  state->sem = CreateSemaphoreA(NULL, 0, 1, NULL);
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
+  NODE_API_CALL(
+      napi_create_reference(env, arguments[0], 1, &state->connection));
+  NODE_API_CALL(napi_get_named_property(env, arguments[0], "playOpusPacket",
                                         &jsPlayOpusPacket));
-  NODE_API_CALL(napi_create_reference(env, arguments[1], 0, &context));
   NODE_API_CALL(napi_create_threadsafe_function(
-      env, jsPlayOpusPacket, NULL, arguments[0], 1, 1, NULL, NULL, context,
-      playOpusPacket, &func));
-  sem = CreateSemaphoreA(NULL, 0, 1, NULL);
-  CreateThread(NULL, 0, ffmpegThread, url, 0, NULL);
-  return FUNCTION(stop);
+      env, jsPlayOpusPacket, NULL, STRING("playOpusPacket"), 1, 1, NULL, NULL,
+      state, playOpusPacket, &state->jsPlay));
+  NODE_API_CALL(napi_wrap(env, this, state, NULL, NULL, NULL));
+  return this;
 }
 
 NAPI_MODULE_INIT(/* napi_env env, napi_value exports */) {
-  EXPORT_FN(play);
+  napi_value AudioPlayer;
+  napi_property_descriptor properties[] = {
+      {.utf8name = "play", .method = play},
+      {.utf8name = "stop", .method = stop}};
+
+  NODE_API_CALL(napi_define_class(
+      env, "AudioPlayer", NAPI_AUTO_LENGTH, createPlayer, NULL,
+      sizeof(properties) / sizeof(properties[0]), properties, &AudioPlayer));
+  NODE_API_CALL(
+      napi_set_named_property(env, exports, "AudioPlayer", AudioPlayer));
   return exports;
 }

@@ -27,6 +27,7 @@ import { once } from "node:events";
 import { createRequire } from "node:module";
 import { env, loadEnvFile } from "node:process";
 import { Client } from "undici";
+const { AudioPlayer } = createRequire(import.meta.url)("./play.node");
 
 time("Ready");
 loadEnvFile();
@@ -52,7 +53,10 @@ const manager = new WebSocketManager({
 let connection: VoiceConnection;
 let id: string;
 let lastMessageId: string | undefined;
-let stop: () => void;
+let player: {
+	play(url: string): void;
+	stop(timeout?: number, force?: boolean): void;
+};
 // let timeout: NodeJS.Timeout;
 
 log("Connecting...");
@@ -101,6 +105,7 @@ connection = joinVoiceChannel({
 	channelId: env["CHANNEL_ID"]!,
 	guildId: env["GUILD_ID"]!,
 });
+player = new AudioPlayer(connection);
 log("Joining voice channel...");
 [lastMessageId] = await Promise.all([
 	lastMessageId ??
@@ -127,10 +132,7 @@ log("Joining voice channel...");
 		AbortSignal.timeout(20_000),
 	),
 ]);
-stop = createRequire(import.meta.url)("./play.node").play(
-	"https://icstream.rds.radio/rds",
-	connection,
-);
+player.play("https://icstream.rds.radio/rds");
 // timeout = setInterval<[{ id: string | undefined }]>(
 // 	async (args) => {
 // 		try {
@@ -223,7 +225,7 @@ stop = createRequire(import.meta.url)("./play.node").play(
 process.once("SIGINT", () => {
 	log("Exiting...");
 	// clearInterval(timeout);
-	stop();
+	player.stop();
 	connection.disconnect();
 	connection.destroy();
 	manager.destroy();

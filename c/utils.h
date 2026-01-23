@@ -232,4 +232,13 @@ static inline double parseDouble(napi_env env, napi_value value, bool ignoreNaN,
                         defaultValue);
   return result;
 }
+static inline bool parseBool(napi_env env, napi_value value,
+                             bool defaultValue) {
+  bool result;
+
+  if (nodeTypeof(env, value) != napi_boolean)
+    return defaultValue;
+  NODE_API_CALL_DEFAULT(napi_get_value_bool(env, value, &result), defaultValue);
+  return result;
+}
 #endif
