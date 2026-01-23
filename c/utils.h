@@ -93,6 +93,17 @@
     fprintf(stderr, "%s: %s\n", msg, buf);                                     \
     exit(1);                                                                   \
   }
+#define STOP(timeout, force)                                                   \
+  {                                                                            \
+    free(state->url);                                                          \
+    state->stopped = true;                                                     \
+    state->url = NULL;                                                         \
+    if ((WaitForSingleObject(state->thread, timeout) == WAIT_TIMEOUT) &&       \
+        force)                                                                 \
+      TerminateThread(state->thread, TERM_CODE);                               \
+    CloseHandle(state->thread);                                                \
+    state->thread = NULL;                                                      \
+  }
 
 #include <node_api.h>
 #include <stdio.h>

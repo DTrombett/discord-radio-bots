@@ -9,7 +9,7 @@
 #include <node_api.h>
 #include <windows.h>
 
-#define BITRATE 383000
+#define BITRATE 380000
 #define BUFFERING_TIME 80
 #define DEFAULT_TIMEOUT 20000
 #define SAMPLE_RATE 48000
@@ -103,6 +103,7 @@ static inline void findAudioStream(AVFormatContext *ic, int *streamNumber,
   CHECK_ERR(avcodec_open2(*decoderContext, decoder, NULL),
             "Could not open decoder");
 }
+// TODO: Avoid recoding when input is already opus
 DWORD WINAPI ffmpegThread(LPVOID data) {
   PlaybackState *state = data;
   int err, streamNumber;
@@ -208,11 +209,13 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
 
   // Flush encoder
   printf("Flushing encoder\n");
+  state->stopped = true;
   avcodec_send_frame(encoderContext, NULL);
   while (avcodec_receive_packet(encoderContext, pkt) >= 0)
     writePacket(pkt, state);
 
   // Close and free
+  printf("Thread is closing\n");
   av_frame_free(&inputFrame);
   av_frame_free(&outputFrame);
   av_packet_free(&pkt);
@@ -220,7 +223,8 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   avcodec_free_context(&decoderContext);
   swr_free(&s);
   avcodec_free_context(&encoderContext);
-  printf("Thread is closing\n");
+  CloseHandle(state->thread);
+  state->thread = NULL;
   return 0;
 }
 
@@ -254,6 +258,8 @@ static napi_value destroy(napi_env env, napi_callback_info cbinfo) {
 
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  if (!state)
+    return UNDEFINED;
   free(state->url);
   state->stopped = true;
   state->url = NULL;
@@ -279,18 +285,17 @@ static napi_value stop(napi_env env, napi_callback_info cbinfo) {
 
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
-  free(state->url);
-  state->stopped = true;
-  state->url = NULL;
-  if ((WaitForSingleObject(state->thread,
-                           parseInt(env, arguments[0], 1, DEFAULT_TIMEOUT)) ==
-       WAIT_TIMEOUT) &&
-      parseBool(env, arguments[1], false))
-    TerminateThread(state->thread, TERM_CODE);
-  CloseHandle(state->thread);
-  state->thread = NULL;
+  if (!state) {
+    NODE_API_CALL(napi_throw_error(env, NULL, "Player is destroyed"));
+    return UNDEFINED;
+  }
+  if (state->stopped)
+    return UNDEFINED;
+  STOP(parseInt(env, arguments[0], 1, DEFAULT_TIMEOUT),
+       parseBool(env, arguments[1], false));
   return UNDEFINED;
 }
+// TODO: Implement pause()
 static napi_value play(napi_env env, napi_callback_info cbinfo) {
   size_t argc = 1;
   napi_value arguments[1];
@@ -299,6 +304,12 @@ static napi_value play(napi_env env, napi_callback_info cbinfo) {
 
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  if (!state) {
+    NODE_API_CALL(napi_throw_error(env, NULL, "Player is destroyed"));
+    return UNDEFINED;
+  }
+  if (!state->stopped)
+    STOP(DEFAULT_TIMEOUT, true);
   state->url = parseString(env, arguments[0]);
   state->paused = false;
   state->stopped = false;
