@@ -56,6 +56,7 @@ let lastMessageId: string | undefined;
 let player: {
 	play(url: string): void;
 	stop(timeout?: number, force?: boolean): void;
+	destroy(timeout?: number, force?: boolean): void;
 };
 // let timeout: NodeJS.Timeout;
 
@@ -225,7 +226,8 @@ player.play("https://icstream.rds.radio/rds");
 process.once("SIGINT", () => {
 	log("Exiting...");
 	// clearInterval(timeout);
-	player.stop();
+	player.destroy();
+	log("Player destroyed");
 	connection.disconnect();
 	connection.destroy();
 	manager.destroy();

@@ -9,18 +9,18 @@
 #include <node_api.h>
 #include <windows.h>
 
-typedef struct {
+typedef volatile struct {
   char *url;
   HANDLE sem;
   HANDLE thread;
   napi_ref connection;
   napi_threadsafe_function jsPlay;
-  volatile bool paused;
-  volatile bool stopped;
+  bool paused;
+  bool stopped;
 } PlaybackState;
 
 static inline void writePacket(AVPacket *pkt, PlaybackState *state) {
-  if (!state->paused) {
+  if (!state->paused && !state->stopped) {
     if (pkt->duration != 960)
       printf("WARNING: unexpected duration %lld\n", pkt->duration);
     napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
@@ -96,7 +96,7 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   SwrContext *s = NULL;
 
   // Initialize
-  av_log_set_level(AV_LOG_DEBUG);
+  av_log_set_level(AV_LOG_INFO);
   assert(pkt && inputFrame && outputFrame && ic);
   printf("Opening input\n");
 
@@ -193,6 +193,7 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   }
 
   // Flush encoder
+  printf("Flushing encoder\n");
   avcodec_send_frame(encoderContext, NULL);
   while (avcodec_receive_packet(encoderContext, pkt) >= 0)
     writePacket(pkt, state);
@@ -205,6 +206,7 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
   avcodec_free_context(&decoderContext);
   swr_free(&s);
   avcodec_free_context(&encoderContext);
+  printf("Thread is closing\n");
   return 0;
 }
 
@@ -223,6 +225,30 @@ static void playOpusPacket(napi_env env, napi_value jsPlayOpusPacket,
       napi_call_function(env, recv, jsPlayOpusPacket, 1, &buffer, NULL), );
   ReleaseSemaphore(state->sem, 1, NULL);
 }
+static napi_value destroy(napi_env env, napi_callback_info cbinfo) {
+  size_t argc = 2;
+  napi_value arguments[2];
+  napi_value this;
+  PlaybackState *state;
+
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
+  NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  free(state->url);
+  state->stopped = true;
+  state->url = NULL;
+  ReleaseSemaphore(state->sem, 1, NULL);
+  if ((WaitForSingleObject(state->thread, parseInt(env, arguments[0], 1,
+                                                   20000)) == WAIT_TIMEOUT) &&
+      parseBool(env, arguments[1], 0))
+    TerminateThread(state->thread, 2033);
+  CloseHandle(state->thread);
+  CloseHandle(state->sem);
+  NODE_API_CALL(napi_delete_reference(env, state->connection));
+  NODE_API_CALL(
+      napi_release_threadsafe_function(state->jsPlay, napi_tsfn_abort));
+  free((void *)state);
+  return UNDEFINED;
+}
 static napi_value stop(napi_env env, napi_callback_info cbinfo) {
   size_t argc = 2;
   napi_value arguments[2];
@@ -232,7 +258,6 @@ static napi_value stop(napi_env env, napi_callback_info cbinfo) {
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
   free(state->url);
-  state->paused = false;
   state->stopped = true;
   state->url = NULL;
   ReleaseSemaphore(state->sem, 1, NULL);
@@ -254,7 +279,8 @@ static napi_value play(napi_env env, napi_callback_info cbinfo) {
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
   state->url = parseString(env, arguments[0]);
   state->paused = false;
-  state->thread = CreateThread(NULL, 0, ffmpegThread, state, 0, NULL);
+  state->stopped = false;
+  state->thread = CreateThread(NULL, 0, ffmpegThread, (void *)state, 0, NULL);
   return UNDEFINED;
 }
 static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
@@ -270,14 +296,15 @@ static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
   state->url = NULL;
   state->sem = CreateSemaphoreA(NULL, 0, 1, NULL);
   NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, arguments, &this, NULL));
-  NODE_API_CALL(
-      napi_create_reference(env, arguments[0], 1, &state->connection));
+  NODE_API_CALL(napi_create_reference(env, arguments[0], 1,
+                                      (napi_ref *)&state->connection));
   NODE_API_CALL(napi_get_named_property(env, arguments[0], "playOpusPacket",
                                         &jsPlayOpusPacket));
   NODE_API_CALL(napi_create_threadsafe_function(
       env, jsPlayOpusPacket, NULL, STRING("playOpusPacket"), 1, 1, NULL, NULL,
-      state, playOpusPacket, &state->jsPlay));
-  NODE_API_CALL(napi_wrap(env, this, state, NULL, NULL, NULL));
+      (void *)state, playOpusPacket,
+      (napi_threadsafe_function *)&state->jsPlay));
+  NODE_API_CALL(napi_wrap(env, this, (void *)state, NULL, NULL, NULL));
   return this;
 }
 
@@ -285,7 +312,8 @@ NAPI_MODULE_INIT(/* napi_env env, napi_value exports */) {
   napi_value AudioPlayer;
   napi_property_descriptor properties[] = {
       {.utf8name = "play", .method = play},
-      {.utf8name = "stop", .method = stop}};
+      {.utf8name = "stop", .method = stop},
+      {.utf8name = "destroy", .method = destroy}};
 
   NODE_API_CALL(napi_define_class(
       env, "AudioPlayer", NAPI_AUTO_LENGTH, createPlayer, NULL,
