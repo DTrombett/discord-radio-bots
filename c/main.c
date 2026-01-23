@@ -76,9 +76,8 @@ static inline void openInput(AVFormatContext *ic, PlaybackState *state) {
   free(state->url);
   state->url = NULL;
   if (av_dict_count(options) > 0) {
-    printf("Couldn't set invalid format options:\n");
+    printf("WARNING: Couldn't set invalid format options:\n");
     printDict(options);
-    exit(1);
   }
 }
 static inline void findAudioStream(AVFormatContext *ic, int *streamNumber,
