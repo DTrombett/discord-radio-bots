@@ -106,7 +106,6 @@ static inline void findAudioStream(AVFormatContext *ic, int *streamNumber,
 DWORD WINAPI ffmpegThread(LPVOID data) {
   PlaybackState *state = data;
   int err, streamNumber;
-  int64_t pts = 0;
   AVCodecContext *decoderContext,
       *encoderContext =
           avcodec_alloc_context3(avcodec_find_encoder_by_name("libopus"));
@@ -182,8 +181,8 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
         // Set resampled frame parameters
         outputFrame->format = encoderContext->sample_fmt;
         outputFrame->nb_samples = encoderContext->frame_size;
-        outputFrame->pts = pts;
         outputFrame->sample_rate = encoderContext->sample_rate;
+        outputFrame->pts = swr_next_pts(s, INT64_MIN) / SAMPLE_RATE;
         av_channel_layout_copy(&outputFrame->ch_layout,
                                &encoderContext->ch_layout);
 
@@ -196,7 +195,6 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
         // Encode frame
         CHECK_ERR(avcodec_send_frame(encoderContext, outputFrame),
                   "Error sending frame to encoder");
-        pts += outputFrame->nb_samples;
         av_frame_unref(outputFrame);
 
         // Receive encoded packets
