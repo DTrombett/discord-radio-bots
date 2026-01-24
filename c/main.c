@@ -11,7 +11,7 @@
 #include <windows.h>
 
 #define BITRATE 380000
-#define BUFFERING_TIME 80
+#define BUFFERING_TIME 320
 #define DEFAULT_TIMEOUT 20000
 #define FRAME_SIZE 960
 #define SAMPLE_RATE 48000
@@ -31,21 +31,19 @@ typedef volatile struct {
 } PlaybackState;
 
 static inline void writePacket(AVPacket *pkt, PlaybackState *state) {
-  if (!state->paused && !state->stopped) {
-    LARGE_INTEGER now;
+  LARGE_INTEGER now;
 
-    napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
-    if (pkt->duration != FRAME_SIZE)
-      printf("WARNING: unexpected duration %lld\n", pkt->duration);
-    QueryPerformanceCounter(&now);
-    if ((now.QuadPart =
-             pkt->pts / (SAMPLE_RATE / 1000) -
-             (now.QuadPart - state->start.QuadPart) * 1000 / freq.QuadPart -
-             BUFFERING_TIME) > 0)
-      Sleep(now.QuadPart);
-    napi_call_threadsafe_function(state->jsPlay, NULL, napi_tsfn_nonblocking);
-    WaitForSingleObject(state->sem, INFINITE);
-  }
+  napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
+  if (pkt->duration != FRAME_SIZE)
+    printf("WARNING: unexpected duration %lld\n", pkt->duration);
+  QueryPerformanceCounter(&now);
+  if ((now.QuadPart =
+           pkt->pts / (SAMPLE_RATE / 1000) -
+           (now.QuadPart - state->start.QuadPart) * 1000 / freq.QuadPart -
+           BUFFERING_TIME) > 0)
+    Sleep(now.QuadPart);
+  napi_call_threadsafe_function(state->jsPlay, NULL, napi_tsfn_nonblocking);
+  WaitForSingleObject(state->sem, INFINITE);
   av_packet_unref(pkt);
 }
 static inline void printDict(const AVDictionary *m) {
@@ -229,22 +227,27 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
       writePacket(pkt, state);
   }
 
-  // Flush encoder
-  printf("Flushing encoder\n");
   state->stopped = true;
-  avcodec_send_frame(encoderContext, NULL);
-  while (avcodec_receive_packet(encoderContext, pkt) >= 0)
-    writePacket(pkt, state);
+  if (encoderContext) {
+    // Flush encoder
+    printf("Flushing encoder\n");
+    avcodec_send_frame(encoderContext, NULL);
+    while (avcodec_receive_packet(encoderContext, pkt) >= 0)
+      writePacket(pkt, state);
+  }
 
   // Close and free
-  printf("Thread is closing\n");
-  av_frame_free(&inputFrame);
-  av_frame_free(&outputFrame);
+  printf("Freeing resources\n");
   av_packet_free(&pkt);
   avformat_close_input(&ic);
-  avcodec_free_context(&decoderContext);
-  swr_free(&s);
-  avcodec_free_context(&encoderContext);
+  if (encoderContext) {
+    av_frame_free(&inputFrame);
+    av_frame_free(&outputFrame);
+    avcodec_free_context(&decoderContext);
+    avcodec_free_context(&encoderContext);
+    swr_free(&s);
+  }
+  printf("Closing thread\n");
   CloseHandle(state->thread);
   state->thread = NULL;
   return 0;
