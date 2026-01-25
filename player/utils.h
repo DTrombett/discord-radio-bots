@@ -95,14 +95,18 @@
   }
 #define STOP(timeout, force)                                                   \
   {                                                                            \
-    free(state->url);                                                          \
     state->stopped = true;                                                     \
+    state->paused = false;                                                     \
+    free(state->url);                                                          \
     state->url = NULL;                                                         \
-    if ((WaitForSingleObject(state->thread, timeout) == WAIT_TIMEOUT) &&       \
-        force)                                                                 \
-      TerminateThread(state->thread, TERM_CODE);                               \
-    CloseHandle(state->thread);                                                \
-    state->thread = NULL;                                                      \
+    ReleaseSemaphore(state->sem, 1, NULL);                                     \
+    if (state->thread) {                                                       \
+      if ((WaitForSingleObject(state->thread, timeout) == WAIT_TIMEOUT) &&     \
+          force)                                                               \
+        TerminateThread(state->thread, TERM_CODE);                             \
+      CloseHandle(state->thread);                                              \
+      state->thread = NULL;                                                    \
+    }                                                                          \
   }
 
 #include <node_api.h>

@@ -27,7 +27,7 @@ import { once } from "node:events";
 import { createRequire } from "node:module";
 import { env, loadEnvFile } from "node:process";
 import { Client } from "undici";
-const { AudioPlayer } = createRequire(import.meta.url)("./play.node");
+const { AudioPlayer } = createRequire(import.meta.url)("./player.node");
 
 time("Ready");
 loadEnvFile();
@@ -54,7 +54,7 @@ let connection: VoiceConnection;
 let id: string;
 let lastMessageId: string | undefined;
 let player: {
-	play(url: string): void;
+	play(url: string, live?: boolean): void;
 	stop(timeout?: number, force?: boolean): void;
 	destroy(timeout?: number, force?: boolean): void;
 };
@@ -133,7 +133,9 @@ log("Joining voice channel...");
 		AbortSignal.timeout(20_000),
 	),
 ]);
-player.play("https://icstream.rds.radio/rds");
+setTimeout(() => {
+	player.play("./dist/audio.mp3");
+}, 5_000);
 // timeout = setInterval<[{ id: string | undefined }]>(
 // 	async (args) => {
 // 		try {
@@ -224,12 +226,12 @@ player.play("https://icstream.rds.radio/rds");
 // 	{ id: undefined },
 // ).unref();
 process.once("SIGINT", () => {
-	log("Exiting...");
-	// clearInterval(timeout);
+	log("Closing...");
 	player.destroy();
 	log("Player destroyed");
 	connection.disconnect();
 	connection.destroy();
 	manager.destroy();
+	log("Exiting...");
 });
 timeEnd("Ready");

@@ -1,9 +1,9 @@
 {
 	"targets": [
 		{
-			"target_name": "play",
+			"target_name": "player",
 			"sources": [
-				"c/main.c"
+				"player/main.c"
 			],
 			"include_dirs": [
 				"deps/ffmpeg/include"

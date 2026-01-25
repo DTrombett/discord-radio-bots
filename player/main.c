@@ -1,4 +1,3 @@
-#include "libavutil/rational.h"
 #define NAPI_VERSION 10
 #include "utils.h"
 #include <assert.h>
@@ -28,22 +27,25 @@ typedef volatile struct {
   napi_threadsafe_function jsPlay;
   bool paused;
   bool stopped;
+  bool live;
 } PlaybackState;
 
 static inline void writePacket(AVPacket *pkt, PlaybackState *state) {
-  LARGE_INTEGER now;
+  if (!state->stopped) {
+    LARGE_INTEGER now;
 
-  napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
-  if (pkt->duration != FRAME_SIZE)
-    printf("WARNING: unexpected duration %lld\n", pkt->duration);
-  QueryPerformanceCounter(&now);
-  if ((now.QuadPart =
-           pkt->pts / (SAMPLE_RATE / 1000) -
-           (now.QuadPart - state->start.QuadPart) * 1000 / freq.QuadPart -
-           BUFFERING_TIME) > 0)
-    Sleep(now.QuadPart);
-  napi_call_threadsafe_function(state->jsPlay, NULL, napi_tsfn_nonblocking);
-  WaitForSingleObject(state->sem, INFINITE);
+    napi_call_threadsafe_function(state->jsPlay, pkt, napi_tsfn_nonblocking);
+    if (pkt->duration != FRAME_SIZE)
+      printf("WARNING: unexpected duration %lld\n", pkt->duration);
+    QueryPerformanceCounter(&now);
+    if ((now.QuadPart =
+             pkt->pts / (SAMPLE_RATE / 1000) -
+             (now.QuadPart - state->start.QuadPart) * 1000 / freq.QuadPart -
+             BUFFERING_TIME) > 0)
+      Sleep(now.QuadPart);
+    napi_call_threadsafe_function(state->jsPlay, NULL, napi_tsfn_nonblocking);
+    WaitForSingleObject(state->sem, INFINITE);
+  }
   av_packet_unref(pkt);
 }
 static inline void printDict(const AVDictionary *m) {
@@ -172,10 +174,16 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
     outputFrame = av_frame_alloc();
   }
 
-  // Read frames
-  while (!state->stopped && (err = av_read_frame(ic, pkt)) != AVERROR_EOF) {
+  while (!state->stopped) {
+    // If paused and not a live stream, we wait for resume
+    if (state->paused && !state->live)
+      WaitForSingleObject(state->sem, INFINITE);
+    // Read frame
+    if ((err = av_read_frame(ic, pkt)) == AVERROR_EOF)
+      break;
     CHECK_ERR(err, "Error reading frame");
-    if (pkt->stream_index != streamNumber) {
+    // Skip if paused (live) or wrong stream
+    if ((state->paused && state->live) || pkt->stream_index != streamNumber) {
       av_packet_unref(pkt);
       continue;
     }
@@ -227,8 +235,49 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
       writePacket(pkt, state);
   }
 
-  state->stopped = true;
-  if (encoderContext) {
+  if (decoderContext && !state->live && !state->stopped) {
+    // Flush decoder
+    printf("Flushing decoder\n");
+    CHECK_ERR(avcodec_send_packet(decoderContext, NULL),
+              "Error flushing decoder");
+    // Receive decoded frames
+    while ((err = avcodec_receive_frame(decoderContext, inputFrame)) >= 0) {
+      // Send frames to resampler
+      CHECK_ERR(swr_convert(s, NULL, 0,
+                            (const uint8_t **)inputFrame->extended_data,
+                            inputFrame->nb_samples),
+                "Error sending frame to resampler");
+      av_frame_unref(inputFrame);
+    }
+    if (err != AVERROR_EOF)
+      CHECK_ERR(err, "Failed to receive frame");
+    // Flush resampler
+    printf("Flushing resampler\n");
+    while ((err = swr_get_out_samples(s, 0)) > 0) {
+      // Set resampled frame parameters
+      outputFrame->format = encoderContext->sample_fmt;
+      outputFrame->nb_samples = encoderContext->frame_size;
+      outputFrame->sample_rate = encoderContext->sample_rate;
+      outputFrame->pts = swr_next_pts(s, INT64_MIN) / SAMPLE_RATE;
+      av_channel_layout_copy(&outputFrame->ch_layout,
+                             &encoderContext->ch_layout);
+
+      // Read resampled frame
+      CHECK_ERR(av_frame_get_buffer(outputFrame, 0), "Failed to get buffer");
+      CHECK_ERR(swr_convert(s, outputFrame->extended_data,
+                            outputFrame->nb_samples, NULL, 0),
+                "Resampling failed");
+
+      // Encode frame
+      CHECK_ERR(avcodec_send_frame(encoderContext, outputFrame),
+                "Error sending frame to encoder");
+      av_frame_unref(outputFrame);
+
+      // Receive encoded packets
+      while ((err = avcodec_receive_packet(encoderContext, pkt)) >= 0)
+        writePacket(pkt, state);
+    }
+    CHECK_ERR(err, "Failed to flush resampler");
     // Flush encoder
     printf("Flushing encoder\n");
     avcodec_send_frame(encoderContext, NULL);
@@ -238,6 +287,7 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
 
   // Close and free
   printf("Freeing resources\n");
+  state->stopped = true;
   av_packet_free(&pkt);
   avformat_close_input(&ic);
   if (encoderContext) {
@@ -247,9 +297,9 @@ DWORD WINAPI ffmpegThread(LPVOID data) {
     avcodec_free_context(&encoderContext);
     swr_free(&s);
   }
-  printf("Closing thread\n");
   CloseHandle(state->thread);
   state->thread = NULL;
+  printf("Closing thread\n");
   return 0;
 }
 
@@ -285,16 +335,8 @@ static napi_value destroy(napi_env env, napi_callback_info cbinfo) {
   NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
   if (!state)
     return UNDEFINED;
-  free(state->url);
-  state->stopped = true;
-  state->url = NULL;
-  ReleaseSemaphore(state->sem, 1, NULL);
-  if ((WaitForSingleObject(state->thread,
-                           parseInt(env, arguments[0], 1, DEFAULT_TIMEOUT)) ==
-       WAIT_TIMEOUT) &&
-      parseBool(env, arguments[1], true))
-    TerminateThread(state->thread, TERM_CODE);
-  CloseHandle(state->thread);
+  STOP(parseInt(env, arguments[0], true, DEFAULT_TIMEOUT),
+       parseBool(env, arguments[1], true));
   CloseHandle(state->sem);
   NODE_API_CALL(napi_delete_reference(env, state->connection));
   NODE_API_CALL(
@@ -320,10 +362,41 @@ static napi_value stop(napi_env env, napi_callback_info cbinfo) {
        parseBool(env, arguments[1], false));
   return UNDEFINED;
 }
-// TODO: Implement pause()
+static napi_value pause(napi_env env, napi_callback_info cbinfo) {
+  size_t argc = 0;
+  napi_value this;
+  PlaybackState *state;
+
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, NULL, &this, NULL));
+  NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  if (!state) {
+    NODE_API_CALL(napi_throw_error(env, NULL, "Player is destroyed"));
+    return UNDEFINED;
+  }
+  state->paused = true;
+  return UNDEFINED;
+}
+static napi_value resume(napi_env env, napi_callback_info cbinfo) {
+  size_t argc = 0;
+  napi_value this;
+  PlaybackState *state;
+
+  NODE_API_CALL(napi_get_cb_info(env, cbinfo, &argc, NULL, &this, NULL));
+  NODE_API_CALL(napi_unwrap(env, this, (void **)&state));
+  if (!state) {
+    NODE_API_CALL(napi_throw_error(env, NULL, "Player is destroyed"));
+    return UNDEFINED;
+  }
+  if (!state->paused || state->stopped)
+    return UNDEFINED;
+  state->paused = false;
+  if (!state->live)
+    ReleaseSemaphore(state->sem, 1, NULL);
+  return UNDEFINED;
+}
 static napi_value play(napi_env env, napi_callback_info cbinfo) {
-  size_t argc = 1;
-  napi_value arguments[1];
+  size_t argc = 2;
+  napi_value arguments[2];
   napi_value this;
   PlaybackState *state;
 
@@ -336,6 +409,7 @@ static napi_value play(napi_env env, napi_callback_info cbinfo) {
   if (!state->stopped)
     STOP(DEFAULT_TIMEOUT, true);
   state->url = parseString(env, arguments[0]);
+  state->live = parseBool(env, arguments[1], false);
   state->paused = false;
   state->stopped = false;
   state->thread = CreateThread(NULL, 0, ffmpegThread, (void *)state, 0, NULL);
@@ -348,6 +422,7 @@ static napi_value createPlayer(napi_env env, napi_callback_info cbinfo) {
   napi_value this;
   PlaybackState *state = malloc(sizeof(PlaybackState));
 
+  state->live = false;
   state->paused = false;
   state->stopped = true;
   state->thread = NULL;
@@ -371,7 +446,10 @@ NAPI_MODULE_INIT(/* napi_env env, napi_value exports */) {
   napi_property_descriptor properties[] = {
       {.utf8name = "play", .method = play},
       {.utf8name = "stop", .method = stop},
-      {.utf8name = "destroy", .method = destroy}};
+      {.utf8name = "pause", .method = pause},
+      {.utf8name = "resume", .method = resume},
+      {.utf8name = "destroy", .method = destroy},
+  };
 
   QueryPerformanceFrequency(&freq);
   NODE_API_CALL(napi_define_class(
